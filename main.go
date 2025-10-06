@@ -1,14 +1,23 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"image/color"
+	"io"
 	"log"
 	"math/rand/v2"
+	"os"
 
 	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/audio"
+	"github.com/hajimehoshi/ebiten/v2/audio/mp3"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/hajimehoshi/ebiten/v2/vector"
 	"github.com/solarlune/resolv"
 )
+
+var sharedAudioContext *audio.Context
 
 const (
 	screenW       = 480
@@ -46,6 +55,8 @@ type Game struct {
 	bgScrollY     float64
 	bgImg         *ebiten.Image
 	Space         *resolv.Space
+	audioPlayer   *audio.Player
+	audioContext  *audio.Context
 }
 
 func NewGame() *Game {
@@ -66,13 +77,33 @@ func NewGame() *Game {
 		log.Fatal(err)
 	}
 	g.bgImg = bg
+	if sharedAudioContext == nil {
+		sharedAudioContext = audio.NewContext(96000)
+	}
+	g.audioContext = sharedAudioContext
+	g.audioPlayer = LoadMP3("echoesofeternitymix.mp3", g.audioContext)
+	if g.audioPlayer != nil {
+		g.audioPlayer.SetVolume(0.8) // Ensure audible volume
+		if err := g.audioPlayer.Rewind(); err != nil {
+			log.Println("audio rewind error:", err)
+		}
+		g.audioPlayer.Play() // Start playing
+	}
 	return g
 }
 
 func (g *Game) Update() error {
 	if g.gameOver {
+		// Stop current audio while on game over
+		if g.audioPlayer != nil {
+			g.audioPlayer.Pause()
+		}
 		// Press R to restart
 		if ebiten.IsKeyPressed(ebiten.KeyR) {
+			if g.audioPlayer != nil {
+				_ = g.audioPlayer.Close()
+				g.audioPlayer = nil
+			}
 			*g = *NewGame()
 		}
 		return nil
@@ -178,13 +209,11 @@ func (g *Game) updateEnemies() {
 		}
 	}
 }
-
-func aabb(a rect, b rect) bool {
-
-	return a.X < b.X+b.W &&
-		a.X+a.W > b.X &&
-		a.Y < b.Y+b.H &&
-		a.Y+a.H > b.Y
+func collisionDetected(a rect, b rect) bool {
+	if a.Collision == nil || b.Collision == nil {
+		return false
+	}
+	return a.Collision.IsIntersecting(b.Collision)
 }
 
 func (g *Game) resolveCollisions() {
@@ -197,7 +226,7 @@ func (g *Game) resolveCollisions() {
 			if !g.enemies[ei].Alive {
 				continue
 			}
-			if aabb(g.bullets[bi], g.enemies[ei]) {
+			if collisionDetected(g.bullets[bi], g.enemies[ei]) {
 				g.bullets[bi].Alive = false
 				g.enemies[ei].Alive = false
 				g.score += 10
@@ -250,30 +279,58 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	}
 
 	// player
-	ebitenutil.DrawRect(screen, g.player.X, g.player.Y, g.player.W, g.player.H, color.RGBA{80, 200, 255, 255})
+	vector.DrawFilledRect(screen, float32(g.player.X), float32(g.player.Y), float32(g.player.W), float32(g.player.H), color.RGBA{R: 80, G: 200, B: 255, A: 255}, false)
 
 	// bullets
 	for _, b := range g.bullets {
-		ebitenutil.DrawRect(screen, b.X, b.Y, b.W, b.H, color.RGBA{255, 240, 120, 255})
+		vector.DrawFilledRect(screen, float32(b.X), float32(b.Y), float32(b.W), float32(b.H), color.RGBA{R: 255, G: 240, B: 120, A: 255}, false)
 	}
 
 	// enemies
 	for _, e := range g.enemies {
-		ebitenutil.DrawRect(screen, e.X, e.Y, e.W, e.H, color.RGBA{255, 80, 120, 255})
+		vector.DrawFilledRect(screen, float32(e.X), float32(e.Y), float32(e.W), float32(e.H), color.RGBA{R: 255, G: 80, B: 120, A: 255}, false)
 	}
 
 	// HUD
-	//	ebitenubugPrint(screen, fmt.Sprintf("Score: %d | Lives: %d\nSpace: shoot | Arrows/A/D: move | R: restart", g.score, g.lives))
+	ebitenutil.DebugPrint(screen, fmt.Sprintf("Score: %d | Lives: %d\nSpace: shoot | Arrows/A/D: move | R: restart", g.score, g.lives))
 
 	if g.gameOver {
-		overlay := color.RGBA{0, 0, 0, 180}
-		ebitenutil.DrawRect(screen, 0, 0, screenW, screenH, overlay)
+		overlay := color.RGBA{R: 0, G: 0, B: 0, A: 180}
+		vector.DrawFilledRect(screen, float32(0), float32(0), float32(screenW), float32(screenH), overlay, false)
 		ebitenutil.DebugPrintAt(screen, "GAME OVER\nPress R to restart", screenW/2-60, screenH/2-10)
 	}
 }
 
-func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
+func (g *Game) Layout(_, _ int) (int, int) {
 	return screenW, screenH
+}
+
+func LoadMP3(name string, context *audio.Context) *audio.Player {
+	f, err := os.Open(name)
+	if err != nil {
+		fmt.Println("Error loading sound:", err)
+		return nil
+	}
+	// Read the whole file into memory so the decoder doesn't depend on an open file handle.
+	data, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		fmt.Println("Error reading sound file:", err)
+		return nil
+	}
+
+	s, err := mp3.DecodeWithSampleRate(context.SampleRate(), bytes.NewReader(data))
+	if err != nil {
+		fmt.Println("Error interpreting sound file:", err)
+		return nil
+	}
+
+	p, err := context.NewPlayer(s)
+	if err != nil {
+		fmt.Println("Couldn't create sound player:", err)
+		return nil
+	}
+	return p
 }
 
 func main() {
